@@ -1,0 +1,4 @@
+# Uma URL de repo GitHub por linha. Linhas iniciadas com # são ignoradas.
+# Exemplos:
+# https://github.com/tiangolo/typer
+# https://github.com/fastapi/fastapi

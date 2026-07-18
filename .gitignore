@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+repos/
+.idea/
+.vscode/
+.claude/settings.local.json
+.mcp.json
+.claude/
