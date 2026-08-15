@@ -2,7 +2,13 @@
 
 Pipeline em Python que transforma repositórios GitHub em **grafos de conhecimento** (via [graphifyy](https://pypi.org/project/graphifyy/), tree-sitter, 100% local) e serve tudo para AI coding assistants via **MCP** — de um único endpoint, com consultas cross-repo.
 
-**Novidade da v0.2**: o próprio MCP é o orquestrador. Você fala no chat *"indexa https://github.com/foo/bar"*, o MCP clona efemeramente, extrai o grafo, comprime, e faz push num repo GitHub dedicado (o "store"). As consultas seguintes leem desse store local — nada de rodar CLI manualmente.
+**v0.4**: 3 providers de storage do grafo, escolhidos por env var:
+
+- `local_git` — clone git em disco. Bom pra dev, permite `index_repo` no chat.
+- `github` — HTTPS `raw.githubusercontent.com`. **Stateless**, ideal para pod K8s.
+- `azure_devops` — HTTPS REST API do Azure DevOps. Stateless também.
+
+A busca cross-repo (`search_symbol` sem `repo`) usa um `search_index` compacto guardado no `index.json` — **nenhum grafo é baixado** para responder buscas por nome.
 
 ## Arquitetura
 
@@ -101,11 +107,70 @@ No chat: `/mcp` deve mostrar `repos-graph` conectado.
 
 ### Env vars
 
+**Geral (todos os providers):**
+
 | Variável | Default | Descrição |
 |---|---|---|
-| `MCP_GRAPH_STORE_DIR` | `~/.mcp-graph-store/repo` | Clone local do store |
-| `MCP_GRAPH_STORE_URL` | `https://github.com/pedrothor/mcp-graph-store.git` | Repo git que hospeda os grafos |
-| `MCP_GRAPH_CACHE_MB` | `200` | Limite do LRU em MB (grafos descompactados) |
+| `MCP_STORE_PROVIDER` | `local_git` | `local_git` \| `github` \| `azure_devops` |
+| `MCP_GRAPH_CACHE_MB` | `200` | Limite do LRU em MB (grafos descompactados em RAM) |
+| `MCP_INDEX_TTL_SEC` | `300` | Cache do `index.json` em RAM (só para providers remotos) |
+
+**Provider `local_git`:**
+
+| Variável | Default |
+|---|---|
+| `MCP_GRAPH_STORE_DIR` | `~/.mcp-graph-store/repo` |
+| `MCP_GRAPH_STORE_URL` | `https://github.com/pedrothor/mcp-graph-store.git` |
+
+**Provider `github`** (stateless, para pod K8s):
+
+| Variável | Default |
+|---|---|
+| `MCP_GITHUB_REPO` | *(obrigatória)* `owner/repo` do store |
+| `MCP_GITHUB_BRANCH` | `main` |
+| `MCP_GITHUB_TOKEN` | *(opcional; 5000 req/h autenticado)* |
+
+**Provider `azure_devops`** (stateless):
+
+| Variável |
+|---|
+| `MCP_AZDO_ORG` |
+| `MCP_AZDO_PROJECT` |
+| `MCP_AZDO_REPO` |
+| `MCP_AZDO_BRANCH` (default `main`) |
+| `MCP_AZDO_PAT` (obrigatório, escopo Code Read) |
+
+### Deploy stateless em K8s (exemplo `github` provider)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: repos-graph-mcp
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: mcp
+          image: your-registry/repos-graph-mcp:latest
+          command: ["python", "mcp_server.py"]
+          env:
+            - name: MCP_STORE_PROVIDER
+              value: github
+            - name: MCP_GITHUB_REPO
+              value: pedrothor/mcp-graph-store
+            - name: MCP_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef: {name: gh-token, key: token}
+            - name: MCP_GRAPH_CACHE_MB
+              value: "300"
+          resources:
+            requests: {memory: 128Mi, cpu: 100m}
+            limits:   {memory: 512Mi, cpu: 500m}
+```
+
+Sem PVC. Sem git. Se o pod cair, sobe outro e re-fetch do index no primeiro tool call.
 
 ## Tools expostas
 
@@ -122,13 +187,16 @@ No chat: `/mcp` deve mostrar `repos-graph` conectado.
 | `shortest_path(repo, source, target)` | Menor caminho entre dois símbolos |
 | `list_communities(repo, top_n)` | Comunidades Leiden (subsistemas) |
 
-### Escrita (rede + git)
+### Escrita (só provider `local_git`)
 
 | Tool | O que faz |
 |---|---|
 | `index_repo(url, force=False)` | Extrai + comprime + push no store |
 | `remove_repo(slug)` | Remove um repo do store + push |
-| `refresh_store()` | `git pull` (útil se outra máquina publicou) |
+| `refresh_store()` | Invalida cache do index/grafos + `git pull` |
+| `store_info()` | Debug: provider ativo + estatísticas de cache |
+
+Em produção (`github`/`azure_devops`), essas tools retornam erro claro — a indexação deve ser feita num job externo (CLI local ou GitHub Actions).
 
 ## Uso legado: CLI local (sem MCP)
 
@@ -152,13 +220,15 @@ Ele detecta automaticamente se deve olhar `./repos/` (local) ou `$MCP_GRAPH_STOR
 
 ```
 .
-├── ingest.py            # extract_to() + CLI
-├── build_index.py       # build_index() + CLI (gera index.json)
-├── mcp_server.py        # servidor MCP (FastMCP stdio)
-├── inspect_graph.py     # resumo textual de um grafo
+├── ingest.py                  # extract_to() reusável + CLI
+├── build_index.py             # build_index() reusável + CLI (com search_index)
+├── mcp_server.py              # servidor MCP (FastMCP stdio, provider factory)
+├── github_store.py            # provider: raw.githubusercontent.com
+├── azure_devops_store.py      # provider: Azure DevOps REST API
+├── inspect_graph.py           # resumo textual de um grafo
 ├── requirements.txt
-├── repos.txt            # (opcional) lote para CLI ingest
-└── repos/               # (gitignored) grafos locais quando usa ingest.py
+├── repos.txt                  # (opcional) lote para CLI ingest
+└── repos/                     # (gitignored) grafos locais dev
 ```
 
 ## Ordem de grandeza de custo por consulta

@@ -77,6 +77,19 @@ def _repo_summary(slug: str, repo_dir: Path) -> dict[str, Any] | None:
 
     file_types = Counter(n.get("file_type", "unknown") for n in nodes)
 
+    # search_index: lista completa e leve dos símbolos, usada pelo mcp_server
+    # para search_symbol cross-repo SEM baixar graph.json.gz. Só id + label +
+    # source_file (o mínimo pra o LLM identificar o hit).
+    search_index = [
+        {
+            "id": n.get("id"),
+            "label": _node_name(n),
+            "source_file": n.get("source_file"),
+        }
+        for n in nodes
+        if n.get("id")
+    ]
+
     summary: dict[str, Any] = {
         "slug": slug,
         "num_nodes": len(nodes),
@@ -86,6 +99,7 @@ def _repo_summary(slug: str, repo_dir: Path) -> dict[str, Any] | None:
         "top_hubs": top_hubs,
         "top_communities": top_communities,
         "size_bytes_gz": graph_gz.stat().st_size,
+        "search_index": search_index,
     }
 
     if meta_path.exists():
