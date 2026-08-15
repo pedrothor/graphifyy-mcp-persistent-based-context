@@ -1,4 +1,6 @@
 graphifyy>=0.9.18
 mcp>=1.0
+montydb>=2.5
 networkx>=3.0
+pydantic-settings>=2.0
 pymongo>=4.7

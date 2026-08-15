@@ -1,5 +1,5 @@
 """MongoStore: único backend de storage do MCP. Guarda repos, nodes e links
-como documentos numa única collection MongoDB.
+como documentos numa única collection.
 
 Modelagem:
     _type = "repo"    -> 1 doc por repo indexado (metadata + summary)
@@ -14,10 +14,9 @@ Modelagem:
     (_type, slug, community)        list_communities
     (_type, label)                  search_symbol cross-repo (regex+i)
 
-Env vars:
-    MONGODB_URI          conexão (default: mongodb://localhost:27017/)
-    MONGODB_DB           database name (default: elos_agent)
-    MONGODB_COLLECTION   collection name (default: mcp)
+Backends (STORAGE_MODE em settings.py):
+    "local"   -> montydb (SQLite em LOCAL_DATA_DIR). Não precisa de servidor.
+    "remote"  -> MongoDB via MONGODB_URI (pymongo).
 """
 
 from __future__ import annotations
@@ -27,17 +26,26 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pymongo import ASCENDING, MongoClient
-from pymongo.collection import Collection
+from pymongo import ASCENDING
+
+from settings import settings
 
 log = logging.getLogger("mongo_store")
+
+# Sem console/stdin herdados. Necessário quando o processo Python roda como
+# filho do MCP client (claude.exe / node.exe) sem console alocado: git.exe e
+# subprocessos filhos travam esperando I/O de console herdado, e o
+# timeout= do subprocess.run não dispara porque netos seguram os pipes.
+_NO_INHERIT: dict = {"stdin": subprocess.DEVNULL}
+if os.name == "nt":
+    _NO_INHERIT["creationflags"] = subprocess.CREATE_NO_WINDOW
 
 
 class MongoStore:
@@ -46,20 +54,49 @@ class MongoStore:
         uri: str | None = None,
         db_name: str | None = None,
         collection_name: str | None = None,
+        mode: str | None = None,
     ) -> None:
-        self.uri = uri or os.environ.get("MONGODB_URI", "mongodb://localhost:27017/")
-        self.db_name = db_name or os.environ.get("MONGODB_DB", "elos_agent")
-        self.coll_name = collection_name or os.environ.get("MONGODB_COLLECTION", "mcp")
+        self.mode = mode or settings.storage_mode
+        self.db_name = db_name or settings.mongodb_db
+        self.coll_name = collection_name or settings.mongodb_collection
 
-        # MongoClient é lazy: não conecta até a primeira operação
-        self._client: MongoClient = MongoClient(self.uri)
-        self._db = self._client[self.db_name]
-        self._coll: Collection = self._db[self.coll_name]
+        if self.mode == "local":
+            from montydb import MontyClient, set_storage
+
+            data_dir = settings.local_data_dir.expanduser().resolve()
+            data_dir.mkdir(parents=True, exist_ok=True)
+            # set_storage é idempotente; usa SQLite pra durabilidade/queries
+            set_storage(
+                repository=str(data_dir),
+                storage="sqlite",
+                use_bson=False,
+            )
+            self.uri = f"montydb+sqlite://{data_dir}"
+            self._client = MontyClient(str(data_dir))
+            self._db = self._client[self.db_name]
+            # sqlite backend não auto-cria a collection em delete/find;
+            # cria uma vez pra todas as ops funcionarem.
+            if self.coll_name not in self._db.list_collection_names():
+                self._db.create_collection(self.coll_name)
+        else:
+            from pymongo import MongoClient
+
+            self.uri = uri or settings.mongodb_uri
+            # MongoClient é lazy: não conecta até a primeira operação
+            self._client = MongoClient(self.uri)
+            self._db = self._client[self.db_name]
+
+        self._coll = self._db[self.coll_name]
         self._indexes_ensured = False
 
     @property
-    def coll(self) -> Collection:
-        """Garante índices na primeira operação real (lazy)."""
+    def coll(self) -> Any:
+        """Garante índices na primeira operação real (lazy).
+
+        Retorna pymongo.collection.Collection (remote) ou
+        montydb.collection.MontyCollection (local) — mesma API para as
+        operações que usamos.
+        """
         if not self._indexes_ensured:
             self._ensure_indexes()
             self._indexes_ensured = True
@@ -119,6 +156,24 @@ class MongoStore:
         return sorted(
             doc["slug"] for doc in self.coll.find({"_type": "repo"}, {"slug": 1, "_id": 0})
         )
+
+    def list_project_modules(self) -> list[dict[str, Any]]:
+        """Módulos distintos já cadastrados, com contagem de repos e slugs.
+
+        Retorna [{module, num_repos, repos: [slug,...]}, ...] ordenado por
+        num_repos desc.
+        """
+        buckets: dict[str, list[str]] = defaultdict(list)
+        for doc in self.coll.find(
+            {"_type": "repo"}, {"slug": 1, "project_module": 1, "_id": 0}
+        ):
+            mod = doc.get("project_module")
+            if mod:
+                buckets[mod].append(doc["slug"])
+        return [
+            {"module": mod, "num_repos": len(slugs), "repos": sorted(slugs)}
+            for mod, slugs in sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)
+        ]
 
     def get_index(self) -> dict[str, Any]:
         """Retorna um "index" no mesmo formato dos providers antigos.
@@ -272,19 +327,18 @@ class MongoStore:
         return {"source": sid, "target": tid, "length": len(path) - 1, "path": path}
 
     def list_communities(self, slug: str, top_n: int = 20) -> list[dict[str, Any]]:
-        pipeline = [
-            {"$match": {"_type": "node", "slug": slug, "community": {"$ne": None}}},
-            {"$group": {"_id": "$community", "labels": {"$push": "$label"}, "size": {"$sum": 1}}},
-            {"$sort": {"size": -1}},
-            {"$limit": top_n},
-        ]
+        # find + agrupamento em Python (montydb não implementa aggregate).
+        # Volume por repo é pequeno (nodes), então custo é aceitável.
+        buckets: dict[Any, list[str | None]] = defaultdict(list)
+        for doc in self.coll.find(
+            {"_type": "node", "slug": slug, "community": {"$ne": None}},
+            {"community": 1, "label": 1, "_id": 0},
+        ):
+            buckets[doc["community"]].append(doc.get("label"))
+        top = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)[:top_n]
         return [
-            {
-                "community_id": doc["_id"],
-                "size": doc["size"],
-                "sample_labels": doc["labels"][:8],
-            }
-            for doc in self.coll.aggregate(pipeline)
+            {"community_id": cid, "size": len(labels), "sample_labels": labels[:8]}
+            for cid, labels in top
         ]
 
     # ----------------------------------------------------------------------
@@ -293,50 +347,97 @@ class MongoStore:
     # ----------------------------------------------------------------------
 
     def publish_repo(
-        self, url: str, *, force: bool = False, graphify_bin: str | None = None
+        self,
+        url: str,
+        project_module: str,
+        *,
+        force: bool = False,
+        graphify_bin: str | None = None,
     ) -> dict[str, Any]:
-        """Clona o url, extrai o grafo com graphify, escreve no Mongo.
+        """Clona o url, extrai o grafo com graphify, escreve no store.
+
+        Args:
+            url: URL do repo (github https ou ssh).
+            project_module: módulo do projeto ao qual o repo pertence
+                (ex.: "payments", "billing"). Obrigatório — usado pra
+                agrupar repos correlatos no cross-repo search.
 
         Retorna dict com status e stats.
         """
+        if not project_module or not project_module.strip():
+            raise ValueError("project_module é obrigatório")
+        project_module = project_module.strip()
         # imports locais para não puxar dependências quando o server for read-only
-        from ingest import parse_github_url, remote_head_sha, repo_slug, GRAPHIFY_BIN
+        from ingest import parse_github_url, remote_head_sha, repo_slug, GRAPHIFY_BIN, git_env
 
         graphify_bin = graphify_bin or GRAPHIFY_BIN
 
         owner, repo = parse_github_url(url)
         slug = repo_slug(owner, repo)
 
-        remote_sha = remote_head_sha(url)
-        existing = self.get_repo_summary(slug)
-        if (
-            not force
-            and existing
-            and remote_sha
-            and existing.get("commit_sha") == remote_sha
-        ):
-            log.info("[%s] SHA %s já indexado, pulando", slug, remote_sha[:8])
-            return {"status": "skipped", "slug": slug, "reason": "SHA remoto igual ao já processado"}
+        # Skip-check só faz sentido quando já existe registro (temos SHA pra comparar).
+        # Isso evita um `git ls-remote` inútil na primeira indexação — e ls-remote
+        # sem timeout foi a causa raiz do hang de 30min anterior.
+        existing = self.get_repo_summary(slug) if not force else None
+        if existing:
+            t0 = time.monotonic()
+            log.info("[%s] checando SHA remoto (timeout=20s)", slug)
+            remote_sha = remote_head_sha(url, timeout=20.0)
+            log.info("[%s] remote sha=%s (em %.2fs)",
+                     slug, (remote_sha[:8] if remote_sha else "unknown"), time.monotonic() - t0)
+            if remote_sha and existing.get("commit_sha") == remote_sha:
+                log.info("[%s] SHA %s já indexado, pulando", slug, remote_sha[:8])
+                return {"status": "skipped", "slug": slug,
+                        "reason": "SHA remoto igual ao já processado"}
+        else:
+            log.info("[%s] repo novo (ou force=True), pulando ls-remote", slug)
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="mongo_publish_"))
-        log.info("[%s] clonando em %s (efêmero)", slug, tmp_dir)
+        log.info("[%s] clonando em %s (efêmero, timeout=120s)", slug, tmp_dir)
         try:
-            subprocess.run(
-                ["git", "clone", "--depth", "1", url, str(tmp_dir)],
-                capture_output=True, text=True, check=True,
-            )
-            head = subprocess.run(
-                ["git", "-C", str(tmp_dir), "rev-parse", "HEAD"],
-                capture_output=True, text=True, check=True,
-            )
+            t0 = time.monotonic()
+            try:
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", url, str(tmp_dir)],
+                    capture_output=True, text=True, check=True,
+                    timeout=120, env=git_env(),
+                    **_NO_INHERIT,
+                )
+            except subprocess.TimeoutExpired:
+                return {"status": "failed", "slug": slug,
+                        "reason": "timeout: git clone excedeu 120s"}
+            except subprocess.CalledProcessError as e:
+                return {"status": "failed", "slug": slug,
+                        "reason": f"git clone rc={e.returncode}",
+                        "stderr": (e.stderr or "")[:500]}
+            log.info("[%s] clone OK (%.2fs)", slug, time.monotonic() - t0)
+
+            try:
+                head = subprocess.run(
+                    ["git", "-C", str(tmp_dir), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, check=True,
+                    timeout=5, env=git_env(),
+                    **_NO_INHERIT,
+                )
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+                return {"status": "failed", "slug": slug,
+                        "reason": f"git rev-parse falhou: {type(e).__name__}"}
             clone_sha = head.stdout.strip()
 
-            log.info("[%s] rodando graphify extract --code-only", slug)
+            t0 = time.monotonic()
+            log.info("[%s] rodando graphify extract --code-only (timeout=300s)", slug)
             out_dir = tmp_dir / "_out"
-            result = subprocess.run(
-                [graphify_bin, "extract", str(tmp_dir), "--code-only", "--out", str(out_dir)],
-                capture_output=True, text=True,
-            )
+            try:
+                result = subprocess.run(
+                    [graphify_bin, "extract", str(tmp_dir), "--code-only", "--out", str(out_dir)],
+                    capture_output=True, text=True, timeout=300,
+                    **_NO_INHERIT,
+                )
+            except subprocess.TimeoutExpired:
+                return {"status": "failed", "slug": slug,
+                        "reason": "timeout: graphify extract excedeu 300s"}
+            log.info("[%s] graphify done (%.2fs, rc=%s)",
+                     slug, time.monotonic() - t0, result.returncode)
             if result.returncode != 0:
                 return {
                     "status": "failed",
@@ -356,13 +457,18 @@ class MongoStore:
             nodes = graph.get("nodes", [])
             links = graph.get("links", [])
 
-            self._write_repo(slug, url, clone_sha, nodes, links)
+            t0 = time.monotonic()
+            log.info("[%s] escrevendo no store (%d nodes, %d links)",
+                     slug, len(nodes), len(links))
+            self._write_repo(slug, url, clone_sha, project_module, nodes, links)
+            log.info("[%s] store write OK (%.2fs)", slug, time.monotonic() - t0)
 
             return {
                 "status": "extracted",
                 "slug": slug,
                 "url": url,
                 "commit_sha": clone_sha,
+                "project_module": project_module,
                 "num_nodes": len(nodes),
                 "num_links": len(links),
             }
@@ -371,7 +477,13 @@ class MongoStore:
             log.info("[%s] clone efêmero deletado", slug)
 
     def _write_repo(
-        self, slug: str, url: str, commit_sha: str, nodes: list[dict], links: list[dict]
+        self,
+        slug: str,
+        url: str,
+        commit_sha: str,
+        project_module: str,
+        nodes: list[dict],
+        links: list[dict],
     ) -> None:
         """Escrita atômica: apaga tudo desse slug + insere de novo (upsert bulk)."""
         # 1. delete old
@@ -434,7 +546,7 @@ class MongoStore:
                 self.coll.insert_many(link_docs, ordered=False)
 
         # 4. compute repo summary (top hubs + top communities + file_types)
-        summary = _compute_summary(slug, url, commit_sha, nodes, links)
+        summary = _compute_summary(slug, url, commit_sha, project_module, nodes, links)
         summary["_id"] = f"repo:{slug}"
         summary["_type"] = "repo"
         self.coll.replace_one({"_id": summary["_id"]}, summary, upsert=True)
@@ -459,7 +571,12 @@ def _rename_node_id(doc: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _compute_summary(
-    slug: str, url: str, commit_sha: str, nodes: list[dict], links: list[dict]
+    slug: str,
+    url: str,
+    commit_sha: str,
+    project_module: str,
+    nodes: list[dict],
+    links: list[dict],
 ) -> dict[str, Any]:
     # graus por nó
     degree: dict[str, int] = defaultdict(int)
@@ -499,6 +616,7 @@ def _compute_summary(
         "slug": slug,
         "url": url,
         "commit_sha": commit_sha,
+        "project_module": project_module,
         "extracted_at_utc": datetime.now(timezone.utc).isoformat(),
         "num_nodes": len(nodes),
         "num_links": len(links),

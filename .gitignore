@@ -7,3 +7,5 @@ repos/
 .claude/settings.local.json
 .mcp.json
 .claude/
+data/
+logs/

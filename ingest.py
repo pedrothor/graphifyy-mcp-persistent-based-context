@@ -43,6 +43,20 @@ GRAPHIFY_BIN = _resolve_graphify()
 log = logging.getLogger("ingest")
 
 
+def git_env() -> dict[str, str]:
+    """Env para chamadas git que impede prompt interativo de credencial.
+
+    Sem isso, no Windows o credential manager pode abrir um prompt silencioso
+    (sem TTY = hang eterno) mesmo para repos públicos, se o helper tentar
+    autenticar antes de detectar que o repo é aberto.
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
+    env["GCM_INTERACTIVE"] = "never"
+    return env
+
+
 def parse_github_url(url: str) -> tuple[str, str]:
     """Extrai (owner, repo) de uma URL GitHub. Aceita https e ssh."""
     url = url.strip().rstrip("/")
@@ -63,13 +77,13 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
 
-def remote_head_sha(url: str) -> str | None:
-    """Retorna SHA do HEAD remoto sem clonar; None se ls-remote falhar."""
+def remote_head_sha(url: str, *, timeout: float = 20.0) -> str | None:
+    """Retorna SHA do HEAD remoto sem clonar; None se ls-remote falhar ou expirar."""
     try:
-        result = _run(["git", "ls-remote", url, "HEAD"])
+        result = _run(["git", "ls-remote", url, "HEAD"], timeout=timeout, env=git_env())
         first_line = result.stdout.strip().splitlines()[0]
         return first_line.split()[0]
-    except (subprocess.CalledProcessError, IndexError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, IndexError):
         return None
 
 

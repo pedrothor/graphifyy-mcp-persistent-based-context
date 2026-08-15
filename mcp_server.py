@@ -1,32 +1,51 @@
-"""MCP server multi-repo. Storage: MongoDB (via mongo_store.py).
+"""MCP server multi-repo. Storage configurável em settings.py.
 
-Env vars:
-    MONGODB_URI          conexão (default: mongodb://localhost:27017/)
-    MONGODB_DB           database (default: elos_agent)
-    MONGODB_COLLECTION   collection (default: mcp)
-    MCP_ALLOW_WRITES     "true" habilita a tool index_repo no runtime.
-                         Em produção deixe unset e faça publish via CI/CLI.
+Config (env vars ou .env):
+    STORAGE_MODE         "local" (montydb+sqlite) ou "remote" (MongoDB). Default: local.
+    LOCAL_DATA_DIR       Diretório dos dados no modo local. Default: ./data
+    MONGODB_URI          Usado só no modo remote. Default: mongodb://localhost:27017/
+    MONGODB_DB           Database name. Default: elos_agent
+    MONGODB_COLLECTION   Collection name. Default: mcp
+    MCP_ALLOW_WRITES     "true" habilita index_repo/remove_repo. Default: false.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from mongo_store import MongoStore
+from settings import settings
 
-ALLOW_WRITES = os.environ.get("MCP_ALLOW_WRITES", "").lower() in ("1", "true", "yes")
+ALLOW_WRITES = settings.mcp_allow_writes
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stderr,
+# Log em stderr (visível se rodar manual) + arquivo (sempre visível via tail).
+# stderr NÃO chega ao usuário quando o cliente MCP auto-spawna o processo,
+# por isso o file handler é o meio prático de acompanhar indexações.
+_log_dir = Path("logs")
+_log_dir.mkdir(exist_ok=True)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+_file_handler = RotatingFileHandler(
+    _log_dir / "mcp_server.log",
+    maxBytes=5_000_000,
+    backupCount=3,
+    encoding="utf-8",
 )
-log = logging.getLogger("mcp-server")
+_file_handler.setFormatter(_fmt)
+_stream_handler = logging.StreamHandler(sys.stderr)
+_stream_handler.setFormatter(_fmt)
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_root.addHandler(_file_handler)
+_root.addHandler(_stream_handler)
+
+log = logging.getLogger("mcp-elos")
 
 mcp = FastMCP("repos-graph")
 
@@ -41,6 +60,18 @@ _store = MongoStore()
 def list_repos() -> list[str]:
     """Slugs de todos os repos presentes no store."""
     return _store.list_repo_slugs()
+
+
+@mcp.tool()
+def list_project_modules() -> list[dict[str, Any]]:
+    """Lista os project_module já cadastrados no store, com contagem de repos.
+
+    Use esta tool ANTES de `index_repo` para mostrar ao usuário os módulos
+    existentes. O usuário pode escolher um deles ou informar um novo nome.
+    Retorna [] se nenhum módulo foi cadastrado ainda — nesse caso peça ao
+    usuário pra definir o primeiro.
+    """
+    return _store.list_project_modules()
 
 
 @mcp.tool()
@@ -121,13 +152,26 @@ def _require_writes() -> None:
 
 
 @mcp.tool()
-def index_repo(url: str, force: bool = False) -> dict[str, Any]:
-    """Clona url efemeramente, extrai grafo com graphify, escreve no MongoDB.
+def index_repo(url: str, project_module: str, force: bool = False) -> dict[str, Any]:
+    """Clona url efemeramente, extrai grafo com graphify, escreve no store.
+
+    FLUXO OBRIGATÓRIO antes de chamar esta tool:
+      1. Chame `list_project_modules` pra obter os módulos já cadastrados.
+      2. Mostre a lista ao usuário e pergunte: "escolhe um destes ou
+         digita um novo nome de módulo".
+      3. Aguarde a resposta — NÃO invente `project_module`.
+      4. Só então chame `index_repo(url, project_module=<resposta>)`.
+
+    Args:
+        url: URL do repo (github https ou ssh).
+        project_module: nome do módulo (existente ou novo), obrigatório,
+            informado pelo usuário.
+        force: reindexa mesmo se o SHA remoto for igual ao já indexado.
 
     Disponível apenas com MCP_ALLOW_WRITES=true.
     """
     _require_writes()
-    return _store.publish_repo(url, force=force)
+    return _store.publish_repo(url, project_module, force=force)
 
 
 @mcp.tool()
@@ -146,8 +190,8 @@ if __name__ == "__main__":
         if "@" in _store.uri else _store.uri
     )
     log.info(
-        "store = %s | db=%s | collection=%s",
-        _safe_uri, _store.db_name, _store.coll_name,
+        "mode=%s | store=%s | db=%s | collection=%s",
+        _store.mode, _safe_uri, _store.db_name, _store.coll_name,
     )
     log.info("allow_writes = %s", ALLOW_WRITES)
     log.info("MCP server pronto (stdio)")
