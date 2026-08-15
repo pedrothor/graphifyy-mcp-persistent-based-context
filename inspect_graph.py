@@ -7,21 +7,53 @@ Uso:
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-REPOS_DIR = ROOT / "repos"
+DEFAULT_REPOS_DIR = ROOT / "repos"
+
+
+def _repos_dir() -> Path:
+    """Store dir: prioriza MCP_GRAPH_STORE_DIR (V3), senão usa ./repos (V1 local)."""
+    env = os.environ.get("MCP_GRAPH_STORE_DIR")
+    if env:
+        p = Path(env) / "repos"
+        if p.exists():
+            return p
+    return DEFAULT_REPOS_DIR
+
+
+def _graph_file(repo_dir: Path) -> Path | None:
+    """Aceita graph.json.gz (novo) ou graph.json (legado)."""
+    gz = repo_dir / "graphify-out" / "graph.json.gz"
+    if gz.exists():
+        return gz
+    js = repo_dir / "graphify-out" / "graph.json"
+    if js.exists():
+        return js
+    return None
+
+
+def _load_graph(path: Path) -> dict:
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
 
 
 def list_repos() -> list[str]:
-    if not REPOS_DIR.exists():
+    repos_dir = _repos_dir()
+    if not repos_dir.exists():
         return []
     return sorted(
-        d.name for d in REPOS_DIR.iterdir()
-        if d.is_dir() and (d / "graphify-out" / "graph.json").exists()
+        d.name for d in repos_dir.iterdir()
+        if d.is_dir() and _graph_file(d) is not None
     )
 
 
@@ -32,13 +64,14 @@ def print_header(text: str) -> None:
 
 
 def inspect(repo: str) -> None:
-    graph_path = REPOS_DIR / repo / "graphify-out" / "graph.json"
-    if not graph_path.exists():
-        print(f"repo '{repo}' não encontrado ou sem graph.json")
+    repos_dir = _repos_dir()
+    repo_dir = repos_dir / repo
+    graph_path = _graph_file(repo_dir)
+    if graph_path is None:
+        print(f"repo '{repo}' não encontrado em {repos_dir}")
         sys.exit(1)
 
-    with graph_path.open(encoding="utf-8") as f:
-        g = json.load(f)
+    g = _load_graph(graph_path)
 
     nodes = g.get("nodes", [])
     links = g.get("links", [])
@@ -107,9 +140,8 @@ def inspect(repo: str) -> None:
         print(f"  {tgt.get('label', first.get('target'))}")
 
     print()
-    print(f"Dica: abra a visualização HTML em")
-    print(f"  {REPOS_DIR / repo / 'graphify-out' / 'GRAPH_TREE.html'}")
-    print(f"(gere com: graphify tree --graph {graph_path})")
+    print(f"Dica: gere visualização HTML com")
+    print(f"  graphify tree --graph {graph_path}")
 
 
 def main() -> None:

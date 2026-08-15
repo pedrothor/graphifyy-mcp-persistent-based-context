@@ -1,13 +1,19 @@
-"""Ingestor multi-repo: clona repos GitHub efemeramente e gera graph.json via graphifyy.
+"""Ingestor multi-repo: clona repos GitHub efemeramente e gera graph.json.gz.
 
-Uso:
+Uso CLI:
     python ingest.py https://github.com/tiangolo/typer
     python ingest.py --from-file repos.txt
     python ingest.py --from-file repos.txt --force
+
+Uso programático (reusado pelo mcp_server.py):
+    from ingest import extract_to, parse_github_url, repo_slug
+    result = extract_to(url, out_dir)
 """
 
 from __future__ import annotations
 
+import argparse
+import gzip
 import json
 import logging
 import os
@@ -60,7 +66,7 @@ def repo_slug(owner: str, repo: str) -> str:
     return f"{owner}__{repo}"
 
 
-def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     log.debug("$ %s", " ".join(cmd))
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
@@ -68,7 +74,7 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 def remote_head_sha(url: str) -> str | None:
     """Retorna SHA do HEAD remoto sem clonar; None se ls-remote falhar."""
     try:
-        result = run(["git", "ls-remote", url, "HEAD"])
+        result = _run(["git", "ls-remote", url, "HEAD"])
         first_line = result.stdout.strip().splitlines()[0]
         return first_line.split()[0]
     except (subprocess.CalledProcessError, IndexError):
@@ -94,13 +100,47 @@ def graphify_version() -> str:
         return "unknown"
 
 
-def ingest_one(url: str, force: bool = False) -> bool:
-    """Processa um repo. Retorna True se gerou/atualizou o grafo, False se pulou."""
+def _compress_graph(graph_json: Path) -> Path:
+    """Comprime graph.json em graph.json.gz (nível 6) e deleta o original."""
+    gz_path = graph_json.with_suffix(graph_json.suffix + ".gz")
+    with graph_json.open("rb") as src, gzip.open(gz_path, "wb", compresslevel=6) as dst:
+        shutil.copyfileobj(src, dst)
+    graph_json.unlink()
+    return gz_path
+
+
+def _summarize_graph(graph_gz: Path) -> tuple[int, int]:
+    """Lê graph.json.gz e retorna (num_nodes, num_links)."""
+    with gzip.open(graph_gz, "rt", encoding="utf-8") as f:
+        data = json.load(f)
+    return len(data.get("nodes", [])), len(data.get("links", []))
+
+
+def extract_to(url: str, out_dir: Path, *, force: bool = False) -> dict:
+    """Extrai o grafo de `url` e escreve em `out_dir`.
+
+    Layout final em out_dir:
+        graphify-out/graph.json.gz
+        meta.json
+
+    Retorna dict com status da operação:
+        {
+          "status": "extracted" | "skipped" | "failed",
+          "slug": "owner__repo",
+          "url": ...,
+          "commit_sha": "...",
+          "graph_path": Path,
+          "num_nodes": int,
+          "num_links": int,
+          "size_bytes_gz": int,
+          "reason": "..." (só quando skipped ou failed)
+        }
+    """
     owner, repo = parse_github_url(url)
     slug = repo_slug(owner, repo)
-    out_dir = REPOS_DIR / slug
+    out_dir = Path(out_dir)
     meta_path = out_dir / "meta.json"
-    graph_path = out_dir / "graphify-out" / "graph.json"
+    graph_gz = out_dir / "graphify-out" / "graph.json.gz"
 
     remote_sha = remote_head_sha(url)
     existing = load_meta(meta_path)
@@ -110,18 +150,25 @@ def ingest_one(url: str, force: bool = False) -> bool:
         and existing
         and remote_sha
         and existing.get("commit_sha") == remote_sha
-        and graph_path.exists()
+        and graph_gz.exists()
     ):
-        log.info("[%s] SHA remoto igual ao processado (%s), pulando", slug, remote_sha[:8])
-        return False
+        log.info("[%s] SHA remoto %s já processado, pulando", slug, remote_sha[:8])
+        return {
+            "status": "skipped",
+            "slug": slug,
+            "url": url,
+            "commit_sha": remote_sha,
+            "graph_path": graph_gz,
+            "reason": "SHA remoto igual ao já processado",
+        }
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="graphify_ingest_"))
     log.info("[%s] clonando em %s (efêmero)", slug, tmp_dir)
 
     try:
-        run(["git", "clone", "--depth", "1", url, str(tmp_dir)])
+        _run(["git", "clone", "--depth", "1", url, str(tmp_dir)])
 
-        head = run(["git", "-C", str(tmp_dir), "rev-parse", "HEAD"])
+        head = _run(["git", "-C", str(tmp_dir), "rev-parse", "HEAD"])
         clone_sha = head.stdout.strip()
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -131,14 +178,7 @@ def ingest_one(url: str, force: bool = False) -> bool:
 
         log.info("[%s] rodando graphify extract --code-only", slug)
         result = subprocess.run(
-            [
-                GRAPHIFY_BIN,
-                "extract",
-                str(tmp_dir),
-                "--code-only",
-                "--out",
-                str(out_dir),
-            ],
+            [GRAPHIFY_BIN, "extract", str(tmp_dir), "--code-only", "--out", str(out_dir)],
             capture_output=True,
             text=True,
         )
@@ -148,11 +188,25 @@ def ingest_one(url: str, force: bool = False) -> bool:
                 log.error("stdout:\n%s", result.stdout)
             if result.stderr:
                 log.error("stderr:\n%s", result.stderr)
-            return False
+            return {
+                "status": "failed",
+                "slug": slug,
+                "url": url,
+                "reason": f"graphify extract rc={result.returncode}",
+            }
 
-        if not graph_path.exists():
-            log.error("[%s] extract terminou mas graph.json não foi criado", slug)
-            return False
+        graph_json = graphify_out / "graph.json"
+        if not graph_json.exists():
+            return {
+                "status": "failed",
+                "slug": slug,
+                "url": url,
+                "reason": "graph.json não foi gerado pelo extract",
+            }
+
+        graph_gz = _compress_graph(graph_json)
+        num_nodes, num_links = _summarize_graph(graph_gz)
+        size_bytes_gz = graph_gz.stat().st_size
 
         meta = {
             "url": url,
@@ -161,10 +215,25 @@ def ingest_one(url: str, force: bool = False) -> bool:
             "commit_sha": clone_sha,
             "extracted_at_utc": datetime.now(timezone.utc).isoformat(),
             "graphifyy_version": graphify_version(),
+            "num_nodes": num_nodes,
+            "num_links": num_links,
+            "size_bytes_gz": size_bytes_gz,
         }
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        log.info("[%s] OK — graph.json em %s", slug, graph_path.relative_to(ROOT))
-        return True
+        log.info(
+            "[%s] OK — %d nós, %d arestas, %.1f KB comprimido",
+            slug, num_nodes, num_links, size_bytes_gz / 1024,
+        )
+        return {
+            "status": "extracted",
+            "slug": slug,
+            "url": url,
+            "commit_sha": clone_sha,
+            "graph_path": graph_gz,
+            "num_nodes": num_nodes,
+            "num_links": num_links,
+            "size_bytes_gz": size_bytes_gz,
+        }
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -181,18 +250,33 @@ def read_urls_file(path: Path) -> list[str]:
     return urls
 
 
-def main(urls: list[str], force: bool = False) -> int:
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Ingesta repos GitHub em grafos graphifyy")
+    parser.add_argument("urls", nargs="*", help="URLs de repos GitHub")
+    parser.add_argument("--from-file", type=Path, help="Arquivo com uma URL por linha")
+    parser.add_argument("--force", action="store_true", help="Re-extrai mesmo se SHA não mudou")
+    args = parser.parse_args()
+
+    urls: list[str] = list(args.urls)
+    if args.from_file:
+        urls.extend(read_urls_file(args.from_file))
+    if not urls:
+        parser.error("informe ao menos uma URL ou use --from-file")
 
     REPOS_DIR.mkdir(exist_ok=True)
 
-    ok = failed = skipped = 0
+    ok = skipped = failed = 0
     for url in urls:
         try:
-            changed = ingest_one(url, force=force)
-            if changed:
+            owner, repo = parse_github_url(url)
+            out_dir = REPOS_DIR / repo_slug(owner, repo)
+            result = extract_to(url, out_dir, force=args.force)
+            if result["status"] == "extracted":
                 ok += 1
-            else:
+            elif result["status"] == "skipped":
                 skipped += 1
+            else:
+                failed += 1
         except Exception as exc:
             log.exception("falha processando %s: %s", url, exc)
             failed += 1
@@ -202,4 +286,4 @@ def main(urls: list[str], force: bool = False) -> int:
 
 
 if __name__ == "__main__":
-    main(urls=["https://github.com/supabase/supabase"])
+    sys.exit(main())
