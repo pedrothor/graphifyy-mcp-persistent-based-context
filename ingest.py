@@ -1,13 +1,14 @@
-"""Ingestor multi-repo: clona repos GitHub efemeramente e gera graph.json.gz.
+"""Utilitários de extração de grafos (helpers reusados por mongo_store).
 
-Uso CLI:
+Contém: parse_github_url, repo_slug, remote_head_sha, GRAPHIFY_BIN, e
+extract_to() (util para gerar graph.json.gz em disco pra debug local).
+
+Publicação oficial para o Mongo é via `publish_to_mongo.py` ou tool
+`index_repo` do MCP. O CLI aqui grava só em `./repos/` (gitignored) e
+não escreve no Mongo — serve pra dev debug.
+
+Uso CLI (debug local):
     python ingest.py https://github.com/tiangolo/typer
-    python ingest.py --from-file repos.txt
-    python ingest.py --from-file repos.txt --force
-
-Uso programático (reusado pelo mcp_server.py):
-    from ingest import extract_to, parse_github_url, repo_slug
-    result = extract_to(url, out_dir)
 """
 
 from __future__ import annotations

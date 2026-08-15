@@ -1,91 +1,166 @@
 # graphifyy-mcp-persistent-based-context
 
-Pipeline em Python que transforma repositórios GitHub em **grafos de conhecimento** (via [graphifyy](https://pypi.org/project/graphifyy/), tree-sitter, 100% local) e serve tudo para AI coding assistants via **MCP** — de um único endpoint, com consultas cross-repo.
+Pipeline Python que transforma repositórios GitHub em **grafos de conhecimento** (via [graphifyy](https://pypi.org/project/graphifyy/), tree-sitter, 100% local) e serve tudo para AI coding assistants via **MCP** — de um único endpoint, com consultas cross-repo, backed por **MongoDB**.
 
-**v0.4**: 3 providers de storage do grafo, escolhidos por env var:
-
-- `local_git` — clone git em disco. Bom pra dev, permite `index_repo` no chat.
-- `github` — HTTPS `raw.githubusercontent.com`. **Stateless**, ideal para pod K8s.
-- `azure_devops` — HTTPS REST API do Azure DevOps. Stateless também.
-
-A busca cross-repo (`search_symbol` sem `repo`) usa um `search_index` compacto guardado no `index.json` — **nenhum grafo é baixado** para responder buscas por nome.
+**v0.5**: storage migrado para MongoDB. O grafo (nodes/links) e metadados de todos os repos ficam numa única collection. Escalável pra 100+ repos, consultas cirúrgicas sem baixar arquivo, RAM constante no pod K8s.
 
 ## Arquitetura
 
 ```
-Você (no chat): "indexa https://github.com/foo/bar"
-   │
-   ▼
-Claude chama tool: index_repo(url)
-   │
-mcp_server.py:
-   1. clone efêmero em %TEMP%
-   2. graphify extract --code-only
-   3. comprime graph.json → graph.json.gz  (~6-25× menor)
-   4. git pull no clone local do STORE
-   5. copia .gz + meta.json pra dentro
-   6. atualiza index.json (stats + hubs + comunidades)
-   7. git add + commit + push  (autenticação: gh CLI local)
-   8. apaga tempdir
-   │
-   ▼
-Você: "quais são os PaymentStatus disponíveis?"
-   │
-Claude chama: search_symbol("PaymentStatus")
-mcp_server.py: lê graph.json.gz do STORE local (cache LRU por bytes)
-   │
-   ▼
-Resposta cross-repo em ~5ms
+Cliente MCP (Claude Code / Cursor)
+        │
+        │ stdio (JSON-RPC)
+        ▼
+┌──────────────────────────────────────────┐
+│ mcp_server.py                             │
+│   9 tools de leitura                      │
+│   (thin — só delega ao MongoStore)        │
+└─────────────────┬────────────────────────┘
+                  │  queries indexadas
+                  ▼
+        ┌──────────────────────┐
+        │  MongoDB             │
+        │  db: elos_agent      │
+        │  collection: mcp     │
+        │                      │
+        │  _type=repo   → 1 doc por repo indexado
+        │  _type=node   → 1 doc por símbolo (função, classe, arquivo…)
+        │  _type=link   → 1 doc por relação (calls, imports, references…)
+        └──────────────────────┘
+                  ▲
+                  │  bulk write
+                  │
+        ┌─────────┴────────────┐
+        │ publish_to_mongo.py  │  clona repo efêmero → graphify extract →
+        │ (ou index_repo tool) │  converte em docs → bulk insert
+        └──────────────────────┘
 ```
 
-## Por que grafo em vez de `.md` gerado por LLM
-
-| | `.md` de arquitetura via LLM | Grafo AST (esta abordagem) |
-|---|---|---|
-| Custo de geração | Tokens × arquivos × cada re-run | Zero API, segundos por repo (só CPU) |
-| Determinismo | Regeneração vira texto diferente | Mesmo commit → mesmo grafo, byte-a-byte |
-| Consumo no chat | LLM relê o `.md` inteiro (~4k tokens) | Consulta pontual (~500–2k tokens) |
-| Erros | LLM pode alucinar relações | Arestas tagueadas `EXTRACTED` vs `INFERRED` |
-| Escala | Desatualiza a cada commit | `index_repo` refaz só quando muda |
-
-## Privacidade
-
-- Extração 100% local via tree-sitter. Sem chamadas a APIs externas, sem chave, sem LLM na hora do extract.
-- Clone é **efêmero**: `git clone --depth 1` em `%TEMP%`, extrai, `shutil.rmtree` em `finally`. Só sobra o `graph.json.gz` derivado.
-- Repos privados usam suas credenciais git locais (gh CLI, SSH, Windows Credential Manager). Nenhum token embutido no código.
-
 ## Setup
-
-Requer Python ≥3.10, `git`, e `gh` autenticado (para push no store).
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 graphify --version   # confirma
-gh auth status       # confirma
 ```
 
-## Storage dos grafos: `mcp-graph-store`
-
-Grafos ficam num repo GitHub separado (default: [pedrothor/mcp-graph-store](https://github.com/pedrothor/mcp-graph-store)). O MCP clona esse repo no startup, faz `git pull` periódico e faz `git push` a cada nova indexação.
-
-Estrutura do store:
+Depois configure as env vars (via `.mcp.json` local ou export no shell):
 
 ```
-mcp-graph-store/
-├── index.json              # metadados leves de todos os repos (~KB por repo)
-├── .gitignore              # ignora arquivos internos do graphify
-└── repos/
-    └── {owner}__{repo}/
-        ├── graphify-out/
-        │   └── graph.json.gz    # grafo comprimido
-        └── meta.json            # url, commit_sha, extracted_at_utc
+MONGODB_URI=mongodb://user:pass@host:27017/       # default: mongodb://localhost:27017/
+MONGODB_DB=elos_agent                              # default
+MONGODB_COLLECTION=mcp                             # default
+MCP_ALLOW_WRITES=true                              # opcional; habilita index_repo tool
 ```
 
-## Registrar no Claude Code
+## Indexar um repo
 
-Crie `.mcp.json` na raiz do projeto (fica gitignored — cada dev tem o seu):
+### Via CLI (`publish_to_mongo.py`) — recomendado para lotes e CI
+
+```powershell
+python publish_to_mongo.py https://github.com/foo/bar
+python publish_to_mongo.py --from-file repos.txt
+python publish_to_mongo.py --from-file repos.txt --force
+python publish_to_mongo.py --remove owner__repo
+```
+
+O que acontece:
+1. `git clone --depth 1` do url em `%TEMP%` (efêmero)
+2. `graphify extract --code-only` (tree-sitter, sem LLM, sem chave)
+3. Converte `graph.json` em documentos Mongo (`_type: repo/node/link`)
+4. `deleteMany({slug})` + `insertMany` (substituição atômica do repo)
+5. Deleta o tempdir
+
+### Via MCP no chat (`index_repo` tool)
+
+Habilite `MCP_ALLOW_WRITES=true` no `.mcp.json`, reinicie o Claude Code, e no chat:
+
+> "indexa https://github.com/pedrothor/payment-api"
+
+## Modelagem no MongoDB
+
+**Repo** — metadados + summary:
+```javascript
+{
+  _id: "repo:pedrothor__payment-api",
+  _type: "repo",
+  slug: "pedrothor__payment-api",
+  url: "https://github.com/pedrothor/payment-api",
+  commit_sha: "07f6a377...",
+  extracted_at_utc: "2026-08-15T...",
+  num_nodes: 29, num_links: 67, num_communities: 5,
+  file_types: {"code": 25, "rationale": 4},
+  top_hubs: [...],
+  top_communities: [...],
+}
+```
+
+**Node** — 1 por símbolo do grafo:
+```javascript
+{
+  _id: "node:pedrothor__payment-api:models_schemas_paymentstatus",
+  _type: "node",
+  slug: "pedrothor__payment-api",
+  node_id: "models_schemas_paymentstatus",
+  label: "PaymentStatus",
+  source_file: "models/schemas.py",
+  source_location: "L7",
+  file_type: "code",
+  community: 3
+}
+```
+
+**Link** — 1 por aresta:
+```javascript
+{
+  _id: "link:pedrothor__payment-api:42",
+  _type: "link",
+  slug: "pedrothor__payment-api",
+  source: "api_client",
+  target: "schemas_paymentstatus",
+  relation: "imports",
+  confidence: "EXTRACTED"
+}
+```
+
+### Índices criados automaticamente (lazy, na primeira operação)
+
+```javascript
+(_type, slug)                        // listar tudo do repo
+(_type, slug, node_id)               // get_node — chave única
+(_type, slug, source)                // BFS de vizinhos (out)
+(_type, slug, target)                // BFS de vizinhos (in)
+(_type, slug, community)             // list_communities
+(_type, label)                       // search_symbol cross-repo (regex + i)
+```
+
+## Tools expostas pelo MCP
+
+**Leitura** (todas usam queries indexadas):
+
+| Tool | Query MongoDB |
+|---|---|
+| `list_repos()` | `find({_type: "repo"}, {slug: 1})` |
+| `describe_repos()` | `find({_type: "repo"})` (metadados leves) |
+| `get_repo_summary(repo)` | `findOne({_type: "repo", slug})` |
+| `search_symbol(pattern, repo?)` | `find({_type: "node", label: /X/i, slug?})` — **cross-repo em 1 query** |
+| `get_node(repo, id)` | `findOne({_type: "node", slug, node_id})` |
+| `get_neighbors(repo, id, depth)` | BFS: N queries indexadas em `source`/`target` |
+| `shortest_path(repo, src, tgt)` | BFS até encontrar (cap 20 níveis) |
+| `list_communities(repo, top_n)` | `aggregate: $match + $group` |
+| `store_info()` | describe (URI mascarada, contagens) |
+
+**Escrita** (só se `MCP_ALLOW_WRITES=true`):
+
+| Tool | O que faz |
+|---|---|
+| `index_repo(url, force=False)` | extrai + escreve no Mongo |
+| `remove_repo(slug)` | deleta todos os docs do slug |
+
+## Registrar o MCP no Claude Code
+
+`.mcp.json` na raiz do projeto (não versionado):
 
 ```json
 {
@@ -94,53 +169,19 @@ Crie `.mcp.json` na raiz do projeto (fica gitignored — cada dev tem o seu):
       "command": ".venv/Scripts/python.exe",
       "args": ["mcp_server.py"],
       "env": {
-        "MCP_GRAPH_STORE_DIR": "C:\\Users\\SEU_USER\\.mcp-graph-store\\repo",
-        "MCP_GRAPH_STORE_URL": "https://github.com/pedrothor/mcp-graph-store.git",
-        "MCP_GRAPH_CACHE_MB": "200"
+        "MONGODB_URI": "mongodb://user:pass@host:27017/",
+        "MONGODB_DB": "elos_agent",
+        "MONGODB_COLLECTION": "mcp",
+        "MCP_ALLOW_WRITES": "true"
       }
     }
   }
 }
 ```
 
-No chat: `/mcp` deve mostrar `repos-graph` conectado.
+Reload da janela do VSCode. Digite `/mcp` no chat pra confirmar conexão.
 
-### Env vars
-
-**Geral (todos os providers):**
-
-| Variável | Default | Descrição |
-|---|---|---|
-| `MCP_STORE_PROVIDER` | `local_git` | `local_git` \| `github` \| `azure_devops` |
-| `MCP_GRAPH_CACHE_MB` | `200` | Limite do LRU em MB (grafos descompactados em RAM) |
-| `MCP_INDEX_TTL_SEC` | `300` | Cache do `index.json` em RAM (só para providers remotos) |
-
-**Provider `local_git`:**
-
-| Variável | Default |
-|---|---|
-| `MCP_GRAPH_STORE_DIR` | `~/.mcp-graph-store/repo` |
-| `MCP_GRAPH_STORE_URL` | `https://github.com/pedrothor/mcp-graph-store.git` |
-
-**Provider `github`** (stateless, para pod K8s):
-
-| Variável | Default |
-|---|---|
-| `MCP_GITHUB_REPO` | *(obrigatória)* `owner/repo` do store |
-| `MCP_GITHUB_BRANCH` | `main` |
-| `MCP_GITHUB_TOKEN` | *(opcional; 5000 req/h autenticado)* |
-
-**Provider `azure_devops`** (stateless):
-
-| Variável |
-|---|
-| `MCP_AZDO_ORG` |
-| `MCP_AZDO_PROJECT` |
-| `MCP_AZDO_REPO` |
-| `MCP_AZDO_BRANCH` (default `main`) |
-| `MCP_AZDO_PAT` (obrigatório, escopo Code Read) |
-
-### Deploy stateless em K8s (exemplo `github` provider)
+## Deploy stateless em K8s
 
 ```yaml
 apiVersion: apps/v1
@@ -148,7 +189,6 @@ kind: Deployment
 metadata:
   name: repos-graph-mcp
 spec:
-  replicas: 1
   template:
     spec:
       containers:
@@ -156,91 +196,47 @@ spec:
           image: your-registry/repos-graph-mcp:latest
           command: ["python", "mcp_server.py"]
           env:
-            - name: MCP_STORE_PROVIDER
-              value: github
-            - name: MCP_GITHUB_REPO
-              value: pedrothor/mcp-graph-store
-            - name: MCP_GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef: {name: gh-token, key: token}
-            - name: MCP_GRAPH_CACHE_MB
-              value: "300"
+            - name: MONGODB_URI
+              valueFrom: {secretKeyRef: {name: mongo, key: uri}}
+            - name: MONGODB_DB
+              value: elos_agent
+            - name: MONGODB_COLLECTION
+              value: mcp
+            # MCP_ALLOW_WRITES não setada → read-only em prod
           resources:
             requests: {memory: 128Mi, cpu: 100m}
-            limits:   {memory: 512Mi, cpu: 500m}
+            limits:   {memory: 256Mi, cpu: 500m}
 ```
 
-Sem PVC. Sem git. Se o pod cair, sobe outro e re-fetch do index no primeiro tool call.
+Publicação (indexação de novos repos) roda separadamente num job/pipeline com `MCP_ALLOW_WRITES=true` e credenciais git.
 
-## Tools expostas
+## Ordem de grandeza
 
-### Leitura (baratas, sem I/O de rede)
-
-| Tool | O que faz |
-|---|---|
-| `list_repos()` | Slugs dos repos no store |
-| `describe_repos()` | Retorna o `index.json` inteiro (stats + hubs + comunidades) |
-| `get_repo_summary(repo)` | Summary de um repo específico |
-| `get_node(repo, node_id)` | Detalhes de um símbolo |
-| `search_symbol(pattern, repo?)` | Busca por substring; se `repo=None`, cross-repo |
-| `get_neighbors(repo, node_id, depth)` | Vizinhança em profundidade N |
-| `shortest_path(repo, source, target)` | Menor caminho entre dois símbolos |
-| `list_communities(repo, top_n)` | Comunidades Leiden (subsistemas) |
-
-### Escrita (só provider `local_git`)
-
-| Tool | O que faz |
-|---|---|
-| `index_repo(url, force=False)` | Extrai + comprime + push no store |
-| `remove_repo(slug)` | Remove um repo do store + push |
-| `refresh_store()` | Invalida cache do index/grafos + `git pull` |
-| `store_info()` | Debug: provider ativo + estatísticas de cache |
-
-Em produção (`github`/`azure_devops`), essas tools retornam erro claro — a indexação deve ser feita num job externo (CLI local ou GitHub Actions).
-
-## Uso legado: CLI local (sem MCP)
-
-O `ingest.py` ainda funciona pra dev/debug local, populando `./repos/`:
-
-```powershell
-python ingest.py https://github.com/tiangolo/typer
-python ingest.py --from-file repos.txt
-```
-
-E `inspect_graph.py` dá visão textual amigável de qualquer grafo:
-
-```powershell
-python inspect_graph.py                      # lista repos
-python inspect_graph.py tiangolo__typer      # resumo
-```
-
-Ele detecta automaticamente se deve olhar `./repos/` (local) ou `$MCP_GRAPH_STORE_DIR/repos/` (store).
+- **RAM do pod**: ~50 MB fixos (pymongo client + pool). Escala 0 com número de repos indexados.
+- **Query típica**: 5-50 ms (indexada). `search_symbol` cross-repo em ~100 repos: ~50-200 ms.
+- **Custo por consulta no LLM**: 500-5000 tokens dependendo da profundidade.
+- **Custo de indexar 1 repo**: 5-30s (clone + extract + insert), sem LLM cost.
 
 ## Estrutura de arquivos
 
 ```
 .
-├── ingest.py                  # extract_to() reusável + CLI
-├── build_index.py             # build_index() reusável + CLI (com search_index)
-├── mcp_server.py              # servidor MCP (FastMCP stdio, provider factory)
-├── github_store.py            # provider: raw.githubusercontent.com
-├── azure_devops_store.py      # provider: Azure DevOps REST API
-├── inspect_graph.py           # resumo textual de um grafo
-├── requirements.txt
-├── repos.txt                  # (opcional) lote para CLI ingest
-└── repos/                     # (gitignored) grafos locais dev
+├── mcp_server.py         # servidor MCP (thin, delega ao MongoStore)
+├── mongo_store.py        # MongoStore: leitura + escrita + índices
+├── publish_to_mongo.py   # CLI para publicar/remover repos
+├── ingest.py             # utilitários (parse_url, extract_to debug local)
+├── inspect_graph.py      # resumo textual de um repo indexado
+├── requirements.txt      # graphifyy + mcp + networkx + pymongo
+├── repos.txt             # (opcional) lista de URLs para lote
+└── repos/                # (gitignored) grafos de debug local
 ```
-
-## Ordem de grandeza de custo por consulta
-
-Uma pergunta típica ao MCP consome entre 500 e 5.000 tokens — as tools retornam só o slice relevante do grafo, não o dump. O `graph.json` do `supabase/supabase` inteiro tem ~22M tokens (inviável); uma consulta específica sobre ele retorna ~1.3k tokens.
 
 ## Limitações conhecidas
 
-- Modo `--code-only` (usado aqui) pula extração semântica de docs/PDFs/imagens. `deep` requer chave LLM (Anthropic/OpenAI/Gemini/Ollama).
-- Grafo captura **estrutura**, não regra de negócio ou decisões arquiteturais. Mantenha ADRs em `.md` no repo original.
-- Autenticação git do MCP hoje usa credencial local (via `gh auth`). Para deploy em servidor, migrar para PAT em env var.
-- Grafos > 100 MB comprimidos exigiriam `git-lfs` — não é o caso na prática.
+- Modo `--code-only` pula extração semântica de docs/PDFs/imagens. `deep` requer chave LLM.
+- Grafo captura estrutura, não regra de negócio ou decisões arquiteturais.
+- `shortest_path` tem cap de 20 níveis (proteção contra grafos com ciclos grandes).
+- Escritas do MCP (index_repo) requerem `git` disponível no ambiente do pod.
 
 ## Licença
 

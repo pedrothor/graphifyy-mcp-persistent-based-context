@@ -6,5 +6,4 @@ repos/
 .vscode/
 .claude/settings.local.json
 .mcp.json
-/index.json
 .claude/
