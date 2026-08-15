@@ -1,19 +1,15 @@
 """Utilitários de extração de grafos (helpers reusados por mongo_store).
 
-Contém: parse_github_url, repo_slug, remote_head_sha, GRAPHIFY_BIN, e
-extract_to() (util para gerar graph.json.gz em disco pra debug local).
+Contém: parse_github_url, repo_slug, remote_head_sha, graphify_version,
+GRAPHIFY_BIN, e extract_to() (útil para gerar graph.json.gz em disco pra
+debug local, se você quiser inspecionar sem passar pelo Mongo).
 
-Publicação oficial para o Mongo é via `publish_to_mongo.py` ou tool
-`index_repo` do MCP. O CLI aqui grava só em `./repos/` (gitignored) e
-não escreve no Mongo — serve pra dev debug.
-
-Uso CLI (debug local):
-    python ingest.py https://github.com/tiangolo/typer
+Sem CLI. Publicação para o Mongo é via MongoStore.publish_repo() ou
+tool index_repo do MCP (com MCP_ALLOW_WRITES=true).
 """
 
 from __future__ import annotations
 
-import argparse
 import gzip
 import json
 import logging
@@ -44,11 +40,6 @@ def _resolve_graphify() -> str:
 
 GRAPHIFY_BIN = _resolve_graphify()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger("ingest")
 
 
@@ -118,24 +109,14 @@ def _summarize_graph(graph_gz: Path) -> tuple[int, int]:
 
 
 def extract_to(url: str, out_dir: Path, *, force: bool = False) -> dict:
-    """Extrai o grafo de `url` e escreve em `out_dir`.
+    """Extrai o grafo de `url` e escreve em `out_dir` (para debug local).
 
     Layout final em out_dir:
         graphify-out/graph.json.gz
         meta.json
 
-    Retorna dict com status da operação:
-        {
-          "status": "extracted" | "skipped" | "failed",
-          "slug": "owner__repo",
-          "url": ...,
-          "commit_sha": "...",
-          "graph_path": Path,
-          "num_nodes": int,
-          "num_links": int,
-          "size_bytes_gz": int,
-          "reason": "..." (só quando skipped ou failed)
-        }
+    Retorna dict com status da operação.
+    Publicação para o Mongo é feita separadamente por MongoStore.publish_repo().
     """
     owner, repo = parse_github_url(url)
     slug = repo_slug(owner, repo)
@@ -239,52 +220,3 @@ def extract_to(url: str, out_dir: Path, *, force: bool = False) -> dict:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         log.info("[%s] clone efêmero deletado", slug)
-
-
-def read_urls_file(path: Path) -> list[str]:
-    urls: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        urls.append(line)
-    return urls
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Ingesta repos GitHub em grafos graphifyy")
-    parser.add_argument("urls", nargs="*", help="URLs de repos GitHub")
-    parser.add_argument("--from-file", type=Path, help="Arquivo com uma URL por linha")
-    parser.add_argument("--force", action="store_true", help="Re-extrai mesmo se SHA não mudou")
-    args = parser.parse_args()
-
-    urls: list[str] = list(args.urls)
-    if args.from_file:
-        urls.extend(read_urls_file(args.from_file))
-    if not urls:
-        parser.error("informe ao menos uma URL ou use --from-file")
-
-    REPOS_DIR.mkdir(exist_ok=True)
-
-    ok = skipped = failed = 0
-    for url in urls:
-        try:
-            owner, repo = parse_github_url(url)
-            out_dir = REPOS_DIR / repo_slug(owner, repo)
-            result = extract_to(url, out_dir, force=args.force)
-            if result["status"] == "extracted":
-                ok += 1
-            elif result["status"] == "skipped":
-                skipped += 1
-            else:
-                failed += 1
-        except Exception as exc:
-            log.exception("falha processando %s: %s", url, exc)
-            failed += 1
-
-    log.info("--- resumo: %d gerados, %d pulados, %d falharam ---", ok, skipped, failed)
-    return 0 if failed == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

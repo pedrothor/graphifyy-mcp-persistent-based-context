@@ -115,7 +115,8 @@ def _require_writes() -> None:
     if not ALLOW_WRITES:
         raise RuntimeError(
             "Escrita desabilitada. Setar MCP_ALLOW_WRITES=true para habilitar "
-            "index_repo/remove_repo. Em produção, use o script publish_to_mongo.py."
+            "index_repo/remove_repo. Em produção, chame MongoStore.publish_repo(url) "
+            "diretamente a partir de um job/pipeline externo."
         )
 
 

@@ -288,7 +288,8 @@ class MongoStore:
         ]
 
     # ----------------------------------------------------------------------
-    # ESCRITA — usada por index_repo tool e publish_to_mongo.py
+    # ESCRITA — usada pela tool index_repo do MCP e por qualquer código
+    # externo que queira publicar/atualizar um repo no store.
     # ----------------------------------------------------------------------
 
     def publish_repo(

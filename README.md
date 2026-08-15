@@ -30,10 +30,11 @@ Cliente MCP (Claude Code / Cursor)
                   ▲
                   │  bulk write
                   │
-        ┌─────────┴────────────┐
-        │ publish_to_mongo.py  │  clona repo efêmero → graphify extract →
-        │ (ou index_repo tool) │  converte em docs → bulk insert
-        └──────────────────────┘
+        ┌──────────────────────────┐
+        │ MongoStore.publish_repo()│  clona repo efêmero → graphify extract →
+        │ (chamada por index_repo  │  converte em docs → bulk insert
+        │  do MCP ou código Python)│
+        └──────────────────────────┘
 ```
 
 ## Setup
@@ -56,27 +57,41 @@ MCP_ALLOW_WRITES=true                              # opcional; habilita index_re
 
 ## Indexar um repo
 
-### Via CLI (`publish_to_mongo.py`) — recomendado para lotes e CI
+### Via chat MCP (`index_repo` tool) — dev local
 
-```powershell
-python publish_to_mongo.py https://github.com/foo/bar
-python publish_to_mongo.py --from-file repos.txt
-python publish_to_mongo.py --from-file repos.txt --force
-python publish_to_mongo.py --remove owner__repo
-```
+Habilite `MCP_ALLOW_WRITES=true` no `.mcp.json`, reinicie o Claude Code, e no chat:
 
-O que acontece:
+> "indexa https://github.com/pedrothor/payment-api"
+
+Isso chama `MongoStore.publish_repo(url)`, que faz:
 1. `git clone --depth 1` do url em `%TEMP%` (efêmero)
 2. `graphify extract --code-only` (tree-sitter, sem LLM, sem chave)
 3. Converte `graph.json` em documentos Mongo (`_type: repo/node/link`)
 4. `deleteMany({slug})` + `insertMany` (substituição atômica do repo)
 5. Deleta o tempdir
 
-### Via MCP no chat (`index_repo` tool)
+### Via código Python (CI/pipeline)
 
-Habilite `MCP_ALLOW_WRITES=true` no `.mcp.json`, reinicie o Claude Code, e no chat:
+Não há CLI dedicado — importe direto:
 
-> "indexa https://github.com/pedrothor/payment-api"
+```python
+from mongo_store import MongoStore
+
+store = MongoStore()  # lê MONGODB_URI/DB/COLLECTION do env
+result = store.publish_repo("https://github.com/foo/bar")
+print(result)         # {"status": "extracted", "slug": ..., "num_nodes": ..., ...}
+
+# lote
+urls = ["https://github.com/a/b", "https://github.com/c/d"]
+for url in urls:
+    store.publish_repo(url, force=False)
+
+# remover
+store.remove_repo("owner__repo")
+```
+
+Coloque isso num script do seu CI (GitHub Actions, Azure Pipelines, etc) e agende
+como preferir (push, cron, manual).
 
 ## Modelagem no MongoDB
 
@@ -223,9 +238,8 @@ Publicação (indexação de novos repos) roda separadamente num job/pipeline co
 .
 ├── mcp_server.py         # servidor MCP (thin, delega ao MongoStore)
 ├── mongo_store.py        # MongoStore: leitura + escrita + índices
-├── publish_to_mongo.py   # CLI para publicar/remover repos
-├── ingest.py             # utilitários (parse_url, extract_to debug local)
-├── inspect_graph.py      # resumo textual de um repo indexado
+├── ingest.py             # utilitários puros (parse_url, extract_to debug local)
+├── inspect_graph.py      # funções para resumo textual (importar e chamar)
 ├── requirements.txt      # graphifyy + mcp + networkx + pymongo
 ├── repos.txt             # (opcional) lista de URLs para lote
 └── repos/                # (gitignored) grafos de debug local
