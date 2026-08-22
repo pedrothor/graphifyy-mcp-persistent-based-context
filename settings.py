@@ -42,5 +42,19 @@ class Settings(BaseSettings):
 
     mcp_allow_writes: bool = Field(False, alias="MCP_ALLOW_WRITES")
 
+    # Projeto default para writes e filtros de leitura. Se definido, sobrepõe
+    # qualquer valor que o agente/cliente passar (trava o server em 1 projeto).
+    # Se vazio, o agente controla per-call e reads sem project retornam tudo.
+    default_project: str | None = Field(None, alias="DEFAULT_PROJECT")
+
+    # Transport do servidor MCP.
+    #   "stdio" -> spawn local pelo cliente (VS Code, Claude Desktop). Default.
+    #   "http"  -> serve streamable HTTP via uvicorn em MCP_HOST:MCP_PORT.
+    mcp_transport: Literal["stdio", "http"] = Field(
+        "stdio", alias="MCP_TRANSPORT"
+    )
+    mcp_host: str = Field("127.0.0.1", alias="MCP_HOST")
+    mcp_port: int = Field(8000, alias="MCP_PORT")
+
 
 settings = Settings()

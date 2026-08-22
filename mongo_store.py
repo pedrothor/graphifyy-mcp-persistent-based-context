@@ -25,15 +25,27 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
+import uuid
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from pymongo import ASCENDING
+from pymongo.errors import DuplicateKeyError
+
+# montydb (backend local) tem sua própria DuplicateKeyError que NÃO herda
+# de pymongo. Se instalado, captura as duas para o lock funcionar em ambos
+# storage modes (local sqlite e remote MongoDB).
+try:
+    from montydb.errors import DuplicateKeyError as _MontyDupKey
+    _DUP_KEY_ERRORS: tuple = (DuplicateKeyError, _MontyDupKey)
+except ImportError:
+    _DUP_KEY_ERRORS = (DuplicateKeyError,)
 
 from settings import settings
 
@@ -46,6 +58,26 @@ log = logging.getLogger("mongo_store")
 _NO_INHERIT: dict = {"stdin": subprocess.DEVNULL}
 if os.name == "nt":
     _NO_INHERIT["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+# Deve cobrir clone+extract do maior repo esperado. Se o processo morrer
+# sem release, o lock expira após esse tempo e outro worker pode assumir.
+_LOCK_TTL_SECONDS = 600
+
+
+def _resolve_project(caller_value: str | None) -> str | None:
+    """Resolve o project pra writes e filtros de leitura.
+
+    Ordem:
+      1. Se settings.default_project setado → sobrepõe (server travado).
+      2. Senão, se o caller passou algo não-vazio → usa.
+      3. Senão → None (sem escopo / sem filtro).
+    """
+    default = (settings.default_project or "").strip()
+    if default:
+        return default
+    if caller_value and str(caller_value).strip():
+        return str(caller_value).strip()
+    return None
 
 
 class MongoStore:
@@ -152,20 +184,31 @@ class MongoStore:
     # LEITURA — usada pelas tools do MCP
     # ----------------------------------------------------------------------
 
-    def list_repo_slugs(self) -> list[str]:
+    def list_repo_slugs(self, project: str | None = None) -> list[str]:
+        query: dict[str, Any] = {"_type": "repo"}
+        resolved = _resolve_project(project)
+        if resolved:
+            query["project"] = resolved
         return sorted(
-            doc["slug"] for doc in self.coll.find({"_type": "repo"}, {"slug": 1, "_id": 0})
+            doc["slug"] for doc in self.coll.find(query, {"slug": 1, "_id": 0})
         )
 
-    def list_project_modules(self) -> list[dict[str, Any]]:
+    def list_project_modules(self, project: str | None = None) -> list[dict[str, Any]]:
         """Módulos distintos já cadastrados, com contagem de repos e slugs.
+
+        Se `project` (resolvido via .env override) for informado, filtra
+        só módulos daquele projeto.
 
         Retorna [{module, num_repos, repos: [slug,...]}, ...] ordenado por
         num_repos desc.
         """
+        query: dict[str, Any] = {"_type": "repo"}
+        resolved = _resolve_project(project)
+        if resolved:
+            query["project"] = resolved
         buckets: dict[str, list[str]] = defaultdict(list)
         for doc in self.coll.find(
-            {"_type": "repo"}, {"slug": 1, "project_module": 1, "_id": 0}
+            query, {"slug": 1, "project_module": 1, "_id": 0}
         ):
             mod = doc.get("project_module")
             if mod:
@@ -173,6 +216,45 @@ class MongoStore:
         return [
             {"module": mod, "num_repos": len(slugs), "repos": sorted(slugs)}
             for mod, slugs in sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)
+        ]
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        """Projetos distintos cadastrados (union de repos + facts).
+
+        Retorna [{project, num_repos, num_facts, num_modules}, ...] ordenado
+        alfabeticamente. Sempre lista tudo — não aplica DEFAULT_PROJECT
+        override (senão veria só o próprio projeto).
+        """
+        stats: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"num_repos": 0, "num_facts": 0, "modules": set()}
+        )
+        for doc in self.coll.find(
+            {"_type": "repo", "project": {"$ne": None}},
+            {"project": 1, "project_module": 1, "_id": 0},
+        ):
+            p = doc.get("project")
+            if not p:
+                continue
+            stats[p]["num_repos"] += 1
+            mod = doc.get("project_module")
+            if mod:
+                stats[p]["modules"].add(mod)
+        for doc in self.coll.find(
+            {"_type": "fact", "project": {"$ne": None}},
+            {"project": 1, "_id": 0},
+        ):
+            p = doc.get("project")
+            if not p:
+                continue
+            stats[p]["num_facts"] += 1
+        return [
+            {
+                "project": p,
+                "num_repos": s["num_repos"],
+                "num_facts": s["num_facts"],
+                "num_modules": len(s["modules"]),
+            }
+            for p, s in sorted(stats.items())
         ]
 
     def get_index(self) -> dict[str, Any]:
@@ -351,8 +433,10 @@ class MongoStore:
         url: str,
         project_module: str,
         *,
+        project: str | None = None,
         force: bool = False,
         graphify_bin: str | None = None,
+        infra_files: list[str] | None = None,
     ) -> dict[str, Any]:
         """Clona o url, extrai o grafo com graphify, escreve no store.
 
@@ -361,16 +445,26 @@ class MongoStore:
             project_module: módulo do projeto ao qual o repo pertence
                 (ex.: "payments", "billing"). Obrigatório — usado pra
                 agrupar repos correlatos no cross-repo search.
+            project: projeto de nível superior. Se DEFAULT_PROJECT estiver
+                setado no .env, sobrepõe este valor. Se ambos vazios, o
+                repo fica sem project (orphan).
+            infra_files: opcional. Lista de paths (relativos à raiz do repo)
+                de arquivos YAML de infra a serem parseados e mergeados no
+                grafo. Ex.: ["cicd/k8s.dev.yaml"]. Se None, nada de infra é
+                indexado. Se a lista está vazia, é tratada como None.
 
-        Retorna dict com status e stats.
+        Retorna dict com status e stats. Em `stats.infra` vem contagem por
+        origem (ex.: {"infra_k8s": {"nodes": 3, "links": 2}}).
         """
         if not project_module or not project_module.strip():
             raise ValueError("project_module é obrigatório")
         project_module = project_module.strip()
+        resolved_project = _resolve_project(project)
         # imports locais para não puxar dependências quando o server for read-only
         from ingest import parse_github_url, remote_head_sha, repo_slug, GRAPHIFY_BIN, git_env
 
         graphify_bin = graphify_bin or GRAPHIFY_BIN
+        infra_files = [p for p in (infra_files or []) if p and p.strip()] or None
 
         owner, repo = parse_github_url(url)
         slug = repo_slug(owner, repo)
@@ -392,89 +486,178 @@ class MongoStore:
         else:
             log.info("[%s] repo novo (ou force=True), pulando ls-remote", slug)
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="mongo_publish_"))
-        log.info("[%s] clonando em %s (efêmero, timeout=120s)", slug, tmp_dir)
+        # Lock por slug: impede duas indexações concorrentes do mesmo repo.
+        # Usa unicidade do _id como primitiva atômica (funciona em Mongo real
+        # e em montydb+sqlite). TTL manual pra sobreviver a workers mortos.
+        lock_id = f"lock:{slug}"
+        now = datetime.now(timezone.utc)
+        lock_doc = {
+            "_id": lock_id,
+            "_type": "lock",
+            "slug": slug,
+            "acquired_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=_LOCK_TTL_SECONDS)).isoformat(),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+        }
         try:
-            t0 = time.monotonic()
-            try:
-                subprocess.run(
-                    ["git", "clone", "--depth", "1", url, str(tmp_dir)],
-                    capture_output=True, text=True, check=True,
-                    timeout=120, env=git_env(),
-                    **_NO_INHERIT,
-                )
-            except subprocess.TimeoutExpired:
-                return {"status": "failed", "slug": slug,
-                        "reason": "timeout: git clone excedeu 120s"}
-            except subprocess.CalledProcessError as e:
-                return {"status": "failed", "slug": slug,
-                        "reason": f"git clone rc={e.returncode}",
-                        "stderr": (e.stderr or "")[:500]}
-            log.info("[%s] clone OK (%.2fs)", slug, time.monotonic() - t0)
-
-            try:
-                head = subprocess.run(
-                    ["git", "-C", str(tmp_dir), "rev-parse", "HEAD"],
-                    capture_output=True, text=True, check=True,
-                    timeout=5, env=git_env(),
-                    **_NO_INHERIT,
-                )
-            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-                return {"status": "failed", "slug": slug,
-                        "reason": f"git rev-parse falhou: {type(e).__name__}"}
-            clone_sha = head.stdout.strip()
-
-            t0 = time.monotonic()
-            log.info("[%s] rodando graphify extract --code-only (timeout=300s)", slug)
-            out_dir = tmp_dir / "_out"
-            try:
-                result = subprocess.run(
-                    [graphify_bin, "extract", str(tmp_dir), "--code-only", "--out", str(out_dir)],
-                    capture_output=True, text=True, timeout=300,
-                    **_NO_INHERIT,
-                )
-            except subprocess.TimeoutExpired:
-                return {"status": "failed", "slug": slug,
-                        "reason": "timeout: graphify extract excedeu 300s"}
-            log.info("[%s] graphify done (%.2fs, rc=%s)",
-                     slug, time.monotonic() - t0, result.returncode)
-            if result.returncode != 0:
+            self.coll.insert_one(lock_doc)
+        except _DUP_KEY_ERRORS:
+            existing_lock = self.coll.find_one({"_id": lock_id}) or {}
+            exp = existing_lock.get("expires_at", "")
+            if exp and exp < now.isoformat():
+                log.warning("[%s] lock órfão (expirou em %s), assumindo", slug, exp)
+                self.coll.delete_one({"_id": lock_id})
+                try:
+                    self.coll.insert_one(lock_doc)
+                except _DUP_KEY_ERRORS:
+                    return {"status": "already_running", "slug": slug,
+                            "reason": "outro worker adquiriu o lock após steal"}
+            else:
+                log.info("[%s] já em andamento por %s/pid=%s (desde %s)",
+                         slug, existing_lock.get("host"), existing_lock.get("pid"),
+                         existing_lock.get("acquired_at"))
                 return {
-                    "status": "failed",
+                    "status": "already_running",
                     "slug": slug,
-                    "reason": f"graphify extract rc={result.returncode}",
-                    "stderr": (result.stderr or "")[:500],
+                    "acquired_at": existing_lock.get("acquired_at"),
+                    "expires_at": existing_lock.get("expires_at"),
+                    "host": existing_lock.get("host"),
+                    "pid": existing_lock.get("pid"),
                 }
+        log.info("[%s] lock adquirido (ttl=%ds)", slug, _LOCK_TTL_SECONDS)
 
-            graph_json = out_dir / "graphify-out" / "graph.json"
-            if not graph_json.exists():
-                return {"status": "failed", "slug": slug, "reason": "graph.json não gerado"}
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="mongo_publish_"))
+            log.info("[%s] clonando em %s (efêmero, timeout=120s)", slug, tmp_dir)
+            try:
+                t0 = time.monotonic()
+                try:
+                    subprocess.run(
+                        ["git", "clone", "--depth", "1", url, str(tmp_dir)],
+                        capture_output=True, text=True, check=True,
+                        timeout=120, env=git_env(),
+                        **_NO_INHERIT,
+                    )
+                except subprocess.TimeoutExpired:
+                    return {"status": "failed", "slug": slug,
+                            "reason": "timeout: git clone excedeu 120s"}
+                except subprocess.CalledProcessError as e:
+                    return {"status": "failed", "slug": slug,
+                            "reason": f"git clone rc={e.returncode}",
+                            "stderr": (e.stderr or "")[:500]}
+                log.info("[%s] clone OK (%.2fs)", slug, time.monotonic() - t0)
 
-            import json
-            with graph_json.open(encoding="utf-8") as f:
-                graph = json.load(f)
+                try:
+                    head = subprocess.run(
+                        ["git", "-C", str(tmp_dir), "rev-parse", "HEAD"],
+                        capture_output=True, text=True, check=True,
+                        timeout=5, env=git_env(),
+                        **_NO_INHERIT,
+                    )
+                except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+                    return {"status": "failed", "slug": slug,
+                            "reason": f"git rev-parse falhou: {type(e).__name__}"}
+                clone_sha = head.stdout.strip()
 
-            nodes = graph.get("nodes", [])
-            links = graph.get("links", [])
+                t0 = time.monotonic()
+                log.info("[%s] rodando graphify extract --code-only (timeout=300s)", slug)
+                out_dir = tmp_dir / "_out"
+                try:
+                    result = subprocess.run(
+                        [graphify_bin, "extract", str(tmp_dir), "--code-only", "--out", str(out_dir)],
+                        capture_output=True, text=True, timeout=300,
+                        **_NO_INHERIT,
+                    )
+                except subprocess.TimeoutExpired:
+                    return {"status": "failed", "slug": slug,
+                            "reason": "timeout: graphify extract excedeu 300s"}
+                log.info("[%s] graphify done (%.2fs, rc=%s)",
+                         slug, time.monotonic() - t0, result.returncode)
 
-            t0 = time.monotonic()
-            log.info("[%s] escrevendo no store (%d nodes, %d links)",
-                     slug, len(nodes), len(links))
-            self._write_repo(slug, url, clone_sha, project_module, nodes, links)
-            log.info("[%s] store write OK (%.2fs)", slug, time.monotonic() - t0)
+                nodes: list[dict] = []
+                links: list[dict] = []
+                code_ok = False
+                if result.returncode == 0:
+                    graph_json = out_dir / "graphify-out" / "graph.json"
+                    if graph_json.exists():
+                        import json
+                        with graph_json.open(encoding="utf-8") as f:
+                            graph = json.load(f)
+                        nodes = list(graph.get("nodes") or [])
+                        links = list(graph.get("links") or [])
+                        code_ok = True
+                    else:
+                        log.warning("[%s] graphify rc=0 mas graph.json ausente", slug)
+                else:
+                    log.warning("[%s] graphify rc=%s: %s",
+                                slug, result.returncode, (result.stderr or "")[:200])
 
-            return {
-                "status": "extracted",
-                "slug": slug,
-                "url": url,
-                "commit_sha": clone_sha,
-                "project_module": project_module,
-                "num_nodes": len(nodes),
-                "num_links": len(links),
-            }
+                # Se não temos código nem infra pra indexar, aborta com erro claro.
+                if not code_ok and not infra_files:
+                    return {"status": "failed", "slug": slug,
+                            "reason": f"graphify extract falhou (rc={result.returncode}) "
+                                      "e nenhum infra_files foi passado",
+                            "stderr": (result.stderr or "")[:500]}
+
+                infra_stats: dict[str, dict] = {}
+                if infra_files:
+                    import infra_extract
+                    resolved: list[Path] = []
+                    skipped: list[str] = []
+                    for rel_path in infra_files:
+                        # sanitize: precisa estar dentro do tmp_dir
+                        candidate = (tmp_dir / rel_path).resolve()
+                        try:
+                            candidate.relative_to(tmp_dir.resolve())
+                        except ValueError:
+                            skipped.append(f"{rel_path} (fora do repo)")
+                            continue
+                        if not candidate.exists():
+                            skipped.append(f"{rel_path} (não existe)")
+                            continue
+                        resolved.append(candidate)
+                    if skipped:
+                        log.warning("[%s] infra_files ignorados: %s", slug, skipped)
+
+                    t0 = time.monotonic()
+                    log.info("[%s] parseando %d arquivo(s) de infra (K8s)", slug, len(resolved))
+                    k8s_nodes, k8s_links = infra_extract.extract_k8s(resolved, tmp_dir)
+                    log.info("[%s] infra K8s: %d nodes, %d links em %.2fs",
+                             slug, len(k8s_nodes), len(k8s_links), time.monotonic() - t0)
+                    nodes.extend(k8s_nodes)
+                    links.extend(k8s_links)
+                    infra_stats["infra_k8s"] = {
+                        "nodes": len(k8s_nodes),
+                        "links": len(k8s_links),
+                        "files_processed": len(resolved),
+                        "files_skipped": skipped,
+                    }
+
+                t0 = time.monotonic()
+                log.info("[%s] escrevendo no store (%d nodes total, %d links total)",
+                         slug, len(nodes), len(links))
+                self._write_repo(slug, url, clone_sha, project_module, resolved_project, nodes, links)
+                log.info("[%s] store write OK (%.2fs)", slug, time.monotonic() - t0)
+
+                return {
+                    "status": "extracted",
+                    "slug": slug,
+                    "url": url,
+                    "commit_sha": clone_sha,
+                    "project": resolved_project,
+                    "project_module": project_module,
+                    "num_nodes": len(nodes),
+                    "num_links": len(links),
+                    "code_extracted": code_ok,
+                    "infra": infra_stats,
+                }
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                log.info("[%s] clone efêmero deletado", slug)
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            log.info("[%s] clone efêmero deletado", slug)
+            self.coll.delete_one({"_id": lock_id})
+            log.info("[%s] lock liberado", slug)
 
     def _write_repo(
         self,
@@ -482,6 +665,7 @@ class MongoStore:
         url: str,
         commit_sha: str,
         project_module: str,
+        project: str | None,
         nodes: list[dict],
         links: list[dict],
     ) -> None:
@@ -546,7 +730,7 @@ class MongoStore:
                 self.coll.insert_many(link_docs, ordered=False)
 
         # 4. compute repo summary (top hubs + top communities + file_types)
-        summary = _compute_summary(slug, url, commit_sha, project_module, nodes, links)
+        summary = _compute_summary(slug, url, commit_sha, project_module, project, nodes, links)
         summary["_id"] = f"repo:{slug}"
         summary["_type"] = "repo"
         self.coll.replace_one({"_id": summary["_id"]}, summary, upsert=True)
@@ -555,8 +739,193 @@ class MongoStore:
         result = self.coll.delete_many({"slug": slug})
         return {"status": "removed", "slug": slug, "deleted_documents": result.deleted_count}
 
+    # ----------------------------------------------------------------------
+    # FACTS — conhecimento operacional que não sai de código nem YAML
+    # (triggers, webhooks, crons, integrações, etc). Docs standalone,
+    # sem espelho no grafo (Opção A). Buscas via search_facts/list_facts.
+    # ----------------------------------------------------------------------
+
+    def add_fact(
+        self,
+        kind: str,
+        title: str,
+        description: str,
+        project_module: str,
+        *,
+        project: str | None = None,
+        metadata: dict | None = None,
+        related_repos: list[str] | None = None,
+        tags: list[str] | None = None,
+        fact_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Cria ou atualiza (upsert) um fact.
+
+        Se `fact_id` foi passado e já existe, faz replace preservando o
+        `created_at` original. Se não existe (ou fact_id=None), gera um
+        UUID novo e insere.
+
+        `project` segue a mesma resolução do publish_repo: DEFAULT_PROJECT
+        do .env sobrepõe; senão usa o que o caller passou; senão fica None.
+
+        Args obrigatórios: kind, title, description, project_module.
+        """
+        for field, val in (("kind", kind), ("title", title),
+                           ("description", description),
+                           ("project_module", project_module)):
+            if not val or not str(val).strip():
+                raise ValueError(f"{field} é obrigatório")
+
+        fid = (fact_id or "").strip() or str(uuid.uuid4())
+        # normaliza: aceita "fact:<uuid>" ou só "<uuid>"
+        if fid.startswith("fact:"):
+            fid = fid[len("fact:"):]
+        doc_id = f"fact:{fid}"
+
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.coll.find_one({"_id": doc_id})
+        created_at = existing["created_at"] if existing else now
+
+        doc: dict[str, Any] = {
+            "_id": doc_id,
+            "_type": "fact",
+            "kind": str(kind).strip(),
+            "title": str(title).strip(),
+            "description": str(description).strip(),
+            "project": _resolve_project(project),
+            "project_module": str(project_module).strip(),
+            "metadata": dict(metadata or {}),
+            "related_repos": list(related_repos or []),
+            "tags": list(tags or []),
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        self.coll.replace_one({"_id": doc_id}, doc, upsert=True)
+        return _fact_out(doc.copy())
+
+    def remove_fact(self, fact_id: str) -> dict[str, Any]:
+        fid = fact_id.strip()
+        if fid.startswith("fact:"):
+            fid = fid[len("fact:"):]
+        doc_id = f"fact:{fid}"
+        result = self.coll.delete_one({"_id": doc_id})
+        return {"status": "removed" if result.deleted_count else "not_found",
+                "fact_id": fid, "deleted_documents": result.deleted_count}
+
+    def get_fact(self, fact_id: str) -> dict[str, Any] | None:
+        fid = fact_id.strip()
+        if fid.startswith("fact:"):
+            fid = fid[len("fact:"):]
+        doc = self.coll.find_one({"_id": f"fact:{fid}"})
+        return _fact_out(doc)
+
+    def list_facts(
+        self,
+        *,
+        project: str | None = None,
+        project_module: str | None = None,
+        kind: str | None = None,
+        tag: str | None = None,
+        related_repo: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {"_type": "fact"}
+        resolved = _resolve_project(project)
+        if resolved:
+            query["project"] = resolved
+        if project_module:
+            query["project_module"] = project_module
+        if kind:
+            query["kind"] = kind
+        if tag:
+            query["tags"] = tag
+        if related_repo:
+            query["related_repos"] = related_repo
+        cursor = self.coll.find(query).limit(limit)
+        return [_fact_out(d) for d in cursor if d is not None]
+
+    def search_facts(
+        self,
+        pattern: str,
+        *,
+        project: str | None = None,
+        project_module: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        rx = {"$regex": re.escape(pattern), "$options": "i"}
+        query: dict[str, Any] = {
+            "_type": "fact",
+            "$or": [{"title": rx}, {"description": rx}, {"tags": rx}],
+        }
+        resolved = _resolve_project(project)
+        if resolved:
+            query["project"] = resolved
+        if project_module:
+            query["project_module"] = project_module
+        cursor = self.coll.find(query).limit(limit)
+        return [_fact_out(d) for d in cursor if d is not None]
+
     def close(self) -> None:
         self._client.close()
+
+
+def list_repo_files(url: str) -> dict[str, Any]:
+    """Clona o repo efêmero e devolve inventário de arquivos + flags de detecção.
+
+    Não escreve nada no store. Pensado pra LLM inspecionar o conteúdo antes
+    de decidir se chama index_repo com/sem `infra_files=[...]`.
+
+    Retorna:
+        {
+          "url": str, "commit_sha": str,
+          "num_files": int,
+          "files": [{"path", "ext", "size"}, ...],
+          "yaml_files": [path, ...],
+          "detected": {"has_code", "has_yaml", "has_terraform"},
+        }
+    """
+    from ingest import parse_github_url, git_env
+    import infra_extract
+
+    parse_github_url(url)  # valida URL cedo
+    tmp_dir = Path(tempfile.mkdtemp(prefix="mongo_list_files_"))
+    log.info("[list_repo_files] clonando %s em %s (timeout=120s)", url, tmp_dir)
+    try:
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", url, str(tmp_dir)],
+                capture_output=True, text=True, check=True,
+                timeout=120, env=git_env(),
+                **_NO_INHERIT,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "url": url,
+                    "reason": "timeout: git clone excedeu 120s"}
+        except subprocess.CalledProcessError as e:
+            return {"status": "failed", "url": url,
+                    "reason": f"git clone rc={e.returncode}",
+                    "stderr": (e.stderr or "")[:500]}
+
+        try:
+            head = subprocess.run(
+                ["git", "-C", str(tmp_dir), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+                timeout=5, env=git_env(),
+                **_NO_INHERIT,
+            )
+            commit_sha = head.stdout.strip()
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            commit_sha = ""
+
+        inventory = infra_extract.classify_files(tmp_dir)
+        return {
+            "status": "ok",
+            "url": url,
+            "commit_sha": commit_sha,
+            **inventory,
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        log.info("[list_repo_files] clone efêmero deletado")
 
 
 # ----- helpers ---------------------------------------------------------------
@@ -570,11 +939,23 @@ def _rename_node_id(doc: dict[str, Any] | None) -> dict[str, Any] | None:
     return doc
 
 
+def _fact_out(doc: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip `_id`/`_type` internos e expõe `fact_id` (só o UUID)."""
+    if doc is None:
+        return None
+    _id = str(doc.pop("_id", ""))
+    doc.pop("_type", None)
+    if _id.startswith("fact:"):
+        doc["fact_id"] = _id[len("fact:"):]
+    return doc
+
+
 def _compute_summary(
     slug: str,
     url: str,
     commit_sha: str,
     project_module: str,
+    project: str | None,
     nodes: list[dict],
     links: list[dict],
 ) -> dict[str, Any]:
@@ -616,6 +997,7 @@ def _compute_summary(
         "slug": slug,
         "url": url,
         "commit_sha": commit_sha,
+        "project": project,
         "project_module": project_module,
         "extracted_at_utc": datetime.now(timezone.utc).isoformat(),
         "num_nodes": len(nodes),

@@ -4,3 +4,4 @@ montydb>=2.5
 networkx>=3.0
 pydantic-settings>=2.0
 pymongo>=4.7
+PyYAML>=6.0
